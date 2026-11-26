@@ -222,6 +222,9 @@ pub fn run<'task, T: ScopedTask<'task>>(
       return Err(err);
     }
   };
+  if abort_signal.as_ref().is_some_and(AbortSignal::is_aborted) {
+    return reject_aborted(env, task, abort_signal, raw_promise, settler, borrow_lease);
+  }
   let task_status = abort_signal
     .as_ref()
     .map_or_else(|| Rc::new(Cell::new(0)), AbortSignal::status);
@@ -294,6 +297,97 @@ pub fn run<'task, T: ScopedTask<'task>>(
   })
 }
 
+/// Settles the promise of a task whose signal aborted before it was queued, without queuing it, as
+/// a cancelled work would be: rejected, then `finally`. The task and its borrow lease go in the
+/// same order as in [`complete_impl`].
+///
+/// An error from `finally` is reported as an uncaught exception, as it is when a work completes,
+/// and the (rejected) promise is still returned: throwing instead would leave that promise with no
+/// handler, and Node.js would report the abort reason as an unhandled rejection in its place.
+fn reject_aborted<'task, T: ScopedTask<'task>>(
+  env: sys::napi_env,
+  task: T,
+  abort_signal: Option<AbortSignal>,
+  raw_promise: sys::napi_value,
+  mut settler: PromiseSettler,
+  borrow_lease: Option<NativeBorrowLease>,
+) -> Result<AsyncWorkPromise<T::JsValue>> {
+  let rejection = abort_rejection(env, abort_signal.as_ref()).map(Settlement::Reject);
+  let concluded = promise::conclude(env, &mut settler, rejection);
+  let settled = matches!(concluded, Ok(true));
+  let result = match concluded {
+    Ok(true) => task.finally(Env::from_raw(env)),
+    Ok(false) => {
+      drop(task);
+      Ok(())
+    }
+    Err(e) => {
+      drop(task);
+      Err(e)
+    }
+  };
+  drop(settler);
+  drop(abort_signal);
+  if let Some(borrow_lease) = borrow_lease {
+    borrow_lease.release(env);
+  }
+  match result {
+    Ok(()) => {}
+    // The promise could not be settled, so it's of no use to the caller.
+    Err(e) if !settled => return Err(e),
+    Err(e) => report_uncaught(env, e)?,
+  }
+  Ok(AsyncWorkPromise {
+    napi_async_work: ptr::null_mut(),
+    raw_promise,
+    env,
+    // Completed: there's no work for `cancel` to touch.
+    status: Rc::new(Cell::new(1)),
+    _phantom: PhantomData,
+  })
+}
+
+/// Raises `error` as an uncaught exception, as an error left pending by a completion callback is.
+#[cfg(feature = "napi3")]
+fn report_uncaught(env: sys::napi_env, error: Error) -> Result<()> {
+  let value = match promise::take_pending_exception(env) {
+    Some(exception) => exception,
+    None => unsafe { ToNapiValue::to_napi_value(env, error) }?,
+  };
+  check_status!(
+    unsafe { sys::napi_fatal_exception(env, value) },
+    "Report AsyncTask finally error failed"
+  )
+}
+
+/// Without `napi_fatal_exception` (Node-API 3), the error is thrown by the call instead.
+#[cfg(not(feature = "napi3"))]
+fn report_uncaught(_env: sys::napi_env, error: Error) -> Result<()> {
+  Err(error)
+}
+
+/// What a cancelled work rejects with: `signal.reason` when its signal aborted, otherwise (a cancel
+/// through [`AsyncWorkPromise::cancel`], a wasm teardown, or a `reason` of `undefined`) an `Error`
+/// named `AbortError`.
+fn abort_rejection(
+  env: sys::napi_env,
+  abort_signal: Option<&AbortSignal>,
+) -> Result<sys::napi_value> {
+  if let Some(reason) = abort_signal
+    .map(|abort_signal| abort_signal.reason(env))
+    .transpose()?
+    .flatten()
+  {
+    return Ok(reason);
+  }
+  const ABORT_ERROR_NAME: &str = "AbortError";
+  let wrapped_env = Env::from_raw(env);
+  let mut error =
+    wrapped_env.create_error(Error::new(Status::Cancelled, ABORT_ERROR_NAME.to_owned()))?;
+  error.set_named_property("name", ABORT_ERROR_NAME)?;
+  Ok(error.0.value)
+}
+
 unsafe impl<'task, T: ScopedTask<'task> + Send> Send for AsyncWork<'task, T> {}
 unsafe impl<'task, T: ScopedTask<'task> + Sync> Sync for AsyncWork<'task, T> {}
 
@@ -338,14 +432,7 @@ fn settle<'task, T: ScopedTask<'task>>(
   work: &mut AsyncWork<'task, T>,
 ) -> Result<bool> {
   if status == sys::Status::napi_cancelled {
-    const ABORT_ERROR_NAME: &str = "AbortError";
-    let wrapped_env = Env::from_raw(env);
-    let rejection = wrapped_env
-      .create_error(Error::new(Status::Cancelled, ABORT_ERROR_NAME.to_owned()))
-      .and_then(|mut error| {
-        error.set_named_property("name", ABORT_ERROR_NAME)?;
-        Ok(Settlement::Reject(error.0.value))
-      });
+    let rejection = abort_rejection(env, work.abort_signal.as_ref()).map(Settlement::Reject);
     return promise::conclude(env, &mut work.settler, rejection);
   }
   let inner_task = work

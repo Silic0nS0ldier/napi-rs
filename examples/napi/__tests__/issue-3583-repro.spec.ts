@@ -271,7 +271,7 @@ poolTest(
 
       // If the pool is larger than the saturator count the aborted task may have
       // started before ctrl.abort(); it then settles normally instead of
-      // AbortError — still a valid settle path for the scope. Closing the abort
+      // rejecting with the abort reason — still a valid settle path for the scope. Closing the abort
       // gate right after abort() lets a task that slipped past the cancellation
       // complete instead of blocking forever on wait_borrow_gate.
       const settled = aborted.promise.then(
@@ -284,7 +284,7 @@ poolTest(
       if (outcome.kind === 'resolved') {
         t.is(outcome.value, (255 * 256) / 2)
       } else {
-        t.is((outcome.err as Error).message, 'AbortError')
+        t.is(outcome.err, ctrl.signal.reason)
       }
 
       // Queued and aborted-but-settled tasks must both release their roots:

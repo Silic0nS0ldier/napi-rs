@@ -59,6 +59,8 @@ struct AbortState {
   /// Shared with the work: 0 not started, 1 completed, 2 cancelled.
   status: Rc<Cell<u8>>,
   callbacks: AbortCallbacks,
+  /// Whether the signal has aborted: already when converted, or since, through the listener.
+  aborted: Cell<bool>,
   /// Set when the [`AbortSignal`] drops. A listener that couldn't be removed then does nothing.
   detached: Cell<bool>,
 }
@@ -69,6 +71,7 @@ impl AbortState {
     if self.detached.get() {
       return;
     }
+    self.aborted.set(true);
     for cb in self.callbacks.borrow().iter() {
       cb();
     }
@@ -92,8 +95,15 @@ impl AbortState {
 /// A JavaScript [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal).
 ///
 /// Converting one registers an `abort` listener with `addEventListener`, which is removed when this
-/// value drops. Passed to [`AsyncTask::with_signal`], it lives until the task settles, and aborting
-/// cancels the task if it hasn't started running yet.
+/// value drops. Passed to [`AsyncTask::with_signal`], it lives until the task settles:
+///
+/// - If the signal is already aborted, the task never runs and its promise rejects with
+///   `signal.reason`.
+/// - Aborting cancels the task if it hasn't started running yet, rejecting with `signal.reason`.
+///   A running task isn't interrupted, and settles as usual.
+///
+/// Where `signal.reason` is `undefined` (Node.js before v17.2, or a polyfill without it), the
+/// rejection is an `Error` named `AbortError` instead.
 ///
 /// Any object with `addEventListener` and `removeEventListener` is accepted, so polyfills work on
 /// Node.js versions without a global `AbortController`.
@@ -119,6 +129,27 @@ impl AbortSignal {
 
   pub(crate) fn set_raw_work(&self, raw_work: sys::napi_async_work) {
     self.state.raw_work.set(raw_work);
+  }
+
+  pub(crate) fn is_aborted(&self) -> bool {
+    self.state.aborted.get()
+  }
+
+  /// `signal.reason` once aborted, unless it's `undefined`.
+  pub(crate) fn reason(&self, env: sys::napi_env) -> crate::Result<Option<sys::napi_value>> {
+    if !self.is_aborted() {
+      return Ok(None);
+    }
+    let mut signal = ptr::null_mut();
+    check_status!(unsafe { sys::napi_get_reference_value(env, self.signal, &mut signal) })?;
+    let mut reason = ptr::null_mut();
+    check_status!(
+      unsafe { sys::napi_get_named_property(env, signal, c"reason".as_ptr(), &mut reason) },
+      "Get AbortSignal.reason failed"
+    )?;
+    let mut value_type = 0;
+    check_status!(unsafe { sys::napi_typeof(env, reason, &mut value_type) })?;
+    Ok((value_type != sys::ValueType::napi_undefined).then_some(reason))
   }
 
   /// Whether `env` can still be called into from this value's `Drop`.
@@ -283,6 +314,19 @@ fn not_an_abort_signal() -> Error {
   Error::new(Status::InvalidArg, "Value is not an AbortSignal".to_owned())
 }
 
+/// `Boolean(signal.aborted)`.
+unsafe fn read_aborted(env: sys::napi_env, signal: sys::napi_value) -> crate::Result<bool> {
+  let mut aborted = ptr::null_mut();
+  check_status!(
+    unsafe { sys::napi_get_named_property(env, signal, c"aborted".as_ptr(), &mut aborted) },
+    "Get AbortSignal.aborted failed"
+  )?;
+  check_status!(unsafe { sys::napi_coerce_to_bool(env, aborted, &mut aborted) })?;
+  let mut result = false;
+  check_status!(unsafe { sys::napi_get_value_bool(env, aborted, &mut result) })?;
+  Ok(result)
+}
+
 /// `target[name]`, which must be a function.
 unsafe fn get_method(
   env: sys::napi_env,
@@ -421,6 +465,7 @@ impl FromNapiValue for AbortSignal {
       raw_work: Cell::new(ptr::null_mut()),
       status: Rc::new(Cell::new(0)),
       callbacks: RefCell::default(),
+      aborted: Cell::new(false),
       detached: Cell::new(false),
     });
     let listener = unsafe { create_listener(env, state.clone()) }?;
@@ -445,6 +490,10 @@ impl FromNapiValue for AbortSignal {
       listener: listener_ref,
     };
     unsafe { call_listener_method(env, napi_val, add_event_listener, listener) }?;
+    // The `abort` event fires once, so a signal that has already fired it is only seen here.
+    if unsafe { read_aborted(env, napi_val) }? {
+      signal.state.aborted.set(true);
+    }
     Ok(signal)
   }
 }

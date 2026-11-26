@@ -2406,8 +2406,8 @@ AbortSignalTest('with abort signal handle', async (t) => {
     t.is(ret, 999)
   } catch (err: unknown) {
     // sometimes on CI, the scheduled task is able to abort
-    // so we only allow it to throw AbortError
-    t.is((err as Error).message, 'AbortError')
+    // so we only allow it to reject with the abort reason
+    t.is(err, ctrl.signal.reason)
   }
 })
 
@@ -2430,8 +2430,8 @@ test('abort signal should be able to reuse with different tasks', async (t) => {
       await promise
     } catch (err: unknown) {
       // sometimes on CI, the scheduled task is able to abort
-      // so we only allow it to throw AbortError
-      t.is((err as Error).message, 'AbortError')
+      // so we only allow it to reject with the abort reason
+      t.is(err, ctrl.signal.reason)
     }
   })
 })
