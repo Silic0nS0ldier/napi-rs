@@ -2352,18 +2352,6 @@ AbortSignalTest('class instance is rejected as AbortSignal', (t) => {
   t.is(notASignal.name, 'rex')
 })
 
-// The onabort handler is an extractable function value; calling it with a
-// foreign receiver must be rejected instead of casting the receiver's wrap
-// payload to the AbortSignal stack.
-AbortSignalTest('stolen onabort rejects a foreign receiver', async (t) => {
-  const ctrl = new AbortController()
-  await withAbortController(1, 2, ctrl.signal)
-  const stolen = ctrl.signal.onabort as unknown as () => void
-  t.throws(() => stolen.call(new Animal(Kind.Cat, 'felix')), {
-    message: 'Value is not an AbortSignal',
-  })
-})
-
 AbortSignalTest('two tasks can share one AbortSignal', async (t) => {
   const ctrl = new AbortController()
   const [a, b] = await Promise.all([
@@ -2372,19 +2360,6 @@ AbortSignalTest('two tasks can share one AbortSignal', async (t) => {
   ])
   t.is(a, 3)
   t.is(b, 7)
-})
-
-// schedule async task always start immediately, hard to create a case that async task is scheduled but not started
-test.skip('async task with abort controller', async (t) => {
-  const ctrl = new AbortController()
-  const promise = withAbortController(1, 2, ctrl.signal)
-  try {
-    ctrl.abort()
-    await promise
-    t.fail('Should throw AbortError')
-  } catch (err: unknown) {
-    t.is((err as Error).message, 'AbortError')
-  }
 })
 
 test('async task with different resolved values', async (t) => {

@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use crate::bindgen_runtime::JsObjectValue;
 use crate::{
-  bindgen_runtime::{NativeBorrowLease, PromiseRaw, ToNapiValue},
+  bindgen_runtime::{AbortSignal, NativeBorrowLease, PromiseRaw, ToNapiValue},
   check_status, sys, Env, Error, JsError, Result, ScopedTask, Status,
 };
 
@@ -55,6 +55,10 @@ struct AsyncWork<'task, T: ScopedTask<'task>> {
   value: mem::MaybeUninit<Result<T::Output>>,
   napi_async_work: sys::napi_async_work,
   status: Rc<Cell<u8>>,
+  /// Kept until the work completes, so the signal's `abort` listener stays registered while the
+  /// work can still be cancelled. Dropped with the box, on the JavaScript thread, which removes
+  /// the listener. Never touched by `execute`.
+  abort_signal: Option<AbortSignal>,
 }
 
 pub struct AsyncWorkPromise<T> {
@@ -186,7 +190,7 @@ impl<T> AsyncWorkPromise<T> {
     if status != sys::Status::napi_ok {
       // The work already started (or the host refused), so it completes normally with
       // `napi_ok`. Status 2 would tell `settle` to leave the promise alone and it would never
-      // settle; go back to "not started", as the `AbortSignal` path does.
+      // settle; go back to "not started", as the `AbortSignal` listener does.
       self.status.set(0);
     }
     check_status!(status, "Cancel async work failed")
@@ -196,7 +200,7 @@ impl<T> AsyncWorkPromise<T> {
 pub fn run<'task, T: ScopedTask<'task>>(
   env: sys::napi_env,
   task: T,
-  abort_status: Option<Rc<Cell<u8>>>,
+  abort_signal: Option<AbortSignal>,
   borrow_lease: Option<NativeBorrowLease>,
 ) -> Result<AsyncWorkPromise<T::JsValue>> {
   let mut undefined = ptr::null_mut();
@@ -211,13 +215,16 @@ pub fn run<'task, T: ScopedTask<'task>>(
       // Same order as the failure paths below: the task (and every reference it captured)
       // goes first, then the lease on the borrow scope.
       drop(task);
+      drop(abort_signal);
       if let Some(borrow_lease) = borrow_lease {
         borrow_lease.release(env);
       }
       return Err(err);
     }
   };
-  let task_status = abort_status.unwrap_or_else(|| Rc::new(Cell::new(0)));
+  let task_status = abort_signal
+    .as_ref()
+    .map_or_else(|| Rc::new(Cell::new(0)), AbortSignal::status);
   let result = Box::leak(Box::new(AsyncWork {
     inner_task: Some(task),
     borrow_lease,
@@ -225,6 +232,7 @@ pub fn run<'task, T: ScopedTask<'task>>(
     value: mem::MaybeUninit::uninit(),
     napi_async_work: ptr::null_mut(),
     status: task_status.clone(),
+    abort_signal,
   }));
   // `run` still owns the `AsyncWork` allocation until `napi_queue_async_work` succeeds, so a
   // failed create/queue must reclaim it: the task, the promise's settle state and the
@@ -269,6 +277,10 @@ pub fn run<'task, T: ScopedTask<'task>>(
       borrow_lease.release(env);
     }
     return Err(err);
+  }
+  // Aborting can cancel the work from here on.
+  if let Some(abort_signal) = &result.abort_signal {
+    abort_signal.set_raw_work(result.napi_async_work);
   }
   // Only a queue that succeeded holds a waiting-request reference for a teardown to balance.
   #[cfg(all(target_family = "wasm", not(feature = "noop")))]
@@ -407,7 +419,7 @@ fn complete_impl<'task, T: ScopedTask<'task>>(
   let outstanding_entry = OutstandingAsyncWorkGuard(napi_async_work);
   let settle_result = settle::<T>(env, status, &mut work);
   // The handle is freed below no matter how settlement went, so the shared
-  // status must read terminal on every path: `on_abort` and
+  // status must read terminal on every path: the `AbortSignal` listener and
   // `AsyncWorkPromise::cancel` only refrain from `napi_cancel_async_work` once
   // it reads 1, and a stale status would send them to freed memory.
   work.status.set(1);
