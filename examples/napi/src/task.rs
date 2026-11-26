@@ -2,6 +2,7 @@ use std::{
   sync::atomic::{AtomicBool, Ordering},
   sync::mpsc,
   thread::sleep,
+  time::{Duration, Instant},
 };
 
 use napi::{bindgen_prelude::*, ScopedTask};
@@ -160,6 +161,73 @@ fn with_abort_signal_handle(signal: AbortSignal) -> AsyncTask<SimpleTask> {
   let (sender, receiver) = mpsc::channel::<i32>();
   signal.on_abort(move || sender.send(999).unwrap());
   AsyncTask::with_signal(SimpleTask { receiver }, signal)
+}
+
+/// Set by [`PollAbortToken::compute`] as it starts, so a test can abort a task that's running
+/// rather than queued. See [`ASYNC_TASK_EXECUTING`].
+static POLL_ABORT_TOKEN_EXECUTING: AtomicBool = AtomicBool::new(false);
+
+pub struct PollAbortToken {
+  token: AbortToken,
+  cancel_immediately: bool,
+}
+
+#[napi]
+impl Task for PollAbortToken {
+  type Output = u32;
+  type JsValue = u32;
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    POLL_ABORT_TOKEN_EXECUTING.store(true, Ordering::SeqCst);
+    if self.cancel_immediately {
+      return Err(Error::new(
+        Status::Cancelled,
+        "cancelled without an abort".to_owned(),
+      ));
+    }
+    // The deadline only keeps a failed test from holding a pool thread forever.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+      self.token.check()?;
+      sleep(Duration::from_millis(1));
+    }
+    Ok(0)
+  }
+
+  fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
+    Ok(output)
+  }
+}
+
+/// Runs a task whose `compute` polls `signal`'s token until it aborts, then fails with
+/// `Status::Cancelled`. With `cancel_immediately`, `compute` fails with `Status::Cancelled` straight
+/// away instead.
+#[napi]
+pub fn poll_abort_token(
+  signal: AbortSignal,
+  cancel_immediately: bool,
+) -> AsyncTask<PollAbortToken> {
+  POLL_ABORT_TOKEN_EXECUTING.store(false, Ordering::SeqCst);
+  let token = signal.token();
+  AsyncTask::with_signal(
+    PollAbortToken {
+      token,
+      cancel_immediately,
+    },
+    signal,
+  )
+}
+
+/// Whether the most recent [`poll_abort_token`] task's `compute` has started.
+#[napi]
+pub fn poll_abort_token_is_executing() -> bool {
+  POLL_ABORT_TOKEN_EXECUTING.load(Ordering::SeqCst)
+}
+
+/// `AbortSignal::aborted` for `signal`.
+#[napi]
+pub fn abort_signal_aborted(signal: AbortSignal) -> bool {
+  signal.aborted()
 }
 
 struct AsyncTaskVoidReturn {}

@@ -3,6 +3,10 @@ use std::ffi::{c_void, CStr};
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::{
+  atomic::{AtomicBool, Ordering},
+  Arc,
+};
 
 #[cfg(not(feature = "noop"))]
 use crate::bindgen_runtime::env_registration::{self, EnvState, RegistrationId};
@@ -60,7 +64,8 @@ struct AbortState {
   status: Rc<Cell<u8>>,
   callbacks: AbortCallbacks,
   /// Whether the signal has aborted: already when converted, or since, through the listener.
-  aborted: Cell<bool>,
+  /// Shared with every [`AbortToken`], which read it from other threads.
+  aborted: Arc<AtomicBool>,
   /// Set when the [`AbortSignal`] drops. A listener that couldn't be removed then does nothing.
   detached: Cell<bool>,
 }
@@ -71,7 +76,7 @@ impl AbortState {
     if self.detached.get() {
       return;
     }
-    self.aborted.set(true);
+    self.aborted.store(true, Ordering::Relaxed);
     for cb in self.callbacks.borrow().iter() {
       cb();
     }
@@ -100,7 +105,10 @@ impl AbortState {
 /// - If the signal is already aborted, the task never runs and its promise rejects with
 ///   `signal.reason`.
 /// - Aborting cancels the task if it hasn't started running yet, rejecting with `signal.reason`.
-///   A running task isn't interrupted, and settles as usual.
+///   A running task isn't interrupted. To stop early, `compute` can poll an [`AbortToken`] from
+///   [`AbortSignal::token`] and return an error with [`Status::Cancelled`] (see
+///   [`AbortToken::check`]), which rejects with `signal.reason` too. Otherwise the task settles as
+///   usual.
 ///
 /// Where `signal.reason` is `undefined` (Node.js before v17.2, or a polyfill without it), the
 /// rejection is an `Error` named `AbortError` instead.
@@ -131,13 +139,23 @@ impl AbortSignal {
     self.state.raw_work.set(raw_work);
   }
 
-  pub(crate) fn is_aborted(&self) -> bool {
-    self.state.aborted.get()
+  /// Whether the signal has aborted, like `signal.aborted`.
+  pub fn aborted(&self) -> bool {
+    self.state.aborted.load(Ordering::Relaxed)
+  }
+
+  /// A token for checking whether the signal has aborted from any thread, e.g. from
+  /// [`Task::compute`](crate::Task::compute).
+  ///
+  /// It follows the signal for as long as this `AbortSignal` is alive. For a signal passed to
+  /// [`AsyncTask::with_signal`], that's until the task settles.
+  pub fn token(&self) -> AbortToken {
+    AbortToken(self.state.aborted.clone())
   }
 
   /// `signal.reason` once aborted, unless it's `undefined`.
   pub(crate) fn reason(&self, env: sys::napi_env) -> crate::Result<Option<sys::napi_value>> {
-    if !self.is_aborted() {
+    if !self.aborted() {
       return Ok(None);
     }
     let mut signal = ptr::null_mut();
@@ -307,6 +325,28 @@ impl Drop for AbortSignal {
   }
 }
 
+/// Whether an [`AbortSignal`] has aborted, readable from any thread. See [`AbortSignal::token`].
+#[derive(Clone, Debug)]
+pub struct AbortToken(Arc<AtomicBool>);
+
+impl AbortToken {
+  /// Whether the signal has aborted. Named like [`AbortSignal::aborted`] and
+  /// `ThreadsafeFunction::aborted`.
+  pub fn aborted(&self) -> bool {
+    // Only the flag itself is shared, so no ordering with other memory is needed.
+    self.0.load(Ordering::Relaxed)
+  }
+
+  /// Returns an error with [`Status::Cancelled`] once the signal has aborted. Returned from
+  /// `compute`, it rejects the task with `signal.reason`.
+  pub fn check(&self) -> crate::Result<()> {
+    if self.aborted() {
+      return Err(Error::new(Status::Cancelled, "AbortError".to_owned()));
+    }
+    Ok(())
+  }
+}
+
 impl UnwindSafe for AbortSignal {}
 impl std::panic::RefUnwindSafe for AbortSignal {}
 
@@ -465,7 +505,7 @@ impl FromNapiValue for AbortSignal {
       raw_work: Cell::new(ptr::null_mut()),
       status: Rc::new(Cell::new(0)),
       callbacks: RefCell::default(),
-      aborted: Cell::new(false),
+      aborted: Arc::new(AtomicBool::new(false)),
       detached: Cell::new(false),
     });
     let listener = unsafe { create_listener(env, state.clone()) }?;
@@ -492,7 +532,7 @@ impl FromNapiValue for AbortSignal {
     unsafe { call_listener_method(env, napi_val, add_event_listener, listener) }?;
     // The `abort` event fires once, so a signal that has already fired it is only seen here.
     if unsafe { read_aborted(env, napi_val) }? {
-      signal.state.aborted.set(true);
+      signal.state.aborted.store(true, Ordering::Relaxed);
     }
     Ok(signal)
   }

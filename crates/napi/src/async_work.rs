@@ -222,7 +222,7 @@ pub fn run<'task, T: ScopedTask<'task>>(
       return Err(err);
     }
   };
-  if abort_signal.as_ref().is_some_and(AbortSignal::is_aborted) {
+  if abort_signal.as_ref().is_some_and(AbortSignal::aborted) {
     return reject_aborted(env, task, abort_signal, raw_promise, settler, borrow_lease);
   }
   let task_status = abort_signal
@@ -366,9 +366,18 @@ fn report_uncaught(_env: sys::napi_env, error: Error) -> Result<()> {
   Err(error)
 }
 
-/// What a cancelled work rejects with: `signal.reason` when its signal aborted, otherwise (a cancel
-/// through [`AsyncWorkPromise::cancel`], a wasm teardown, or a `reason` of `undefined`) an `Error`
-/// named `AbortError`.
+/// The rejection for a task that was stopped. Used when:
+///
+/// - its signal was already aborted, so it never queued,
+/// - its work was cancelled while queued, or
+/// - it failed with [`Status::Cancelled`] after its signal aborted.
+///
+/// It rejects with `signal.reason` when the signal aborted, and otherwise with an `Error` named
+/// `AbortError`. That covers:
+///
+/// - a cancel through [`AsyncWorkPromise::cancel`],
+/// - a wasm teardown cancelling outstanding work, and
+/// - a `reason` of `undefined` (Node.js before v17.2, or a polyfill without it).
 fn abort_rejection(
   env: sys::napi_env,
   abort_signal: Option<&AbortSignal>,
@@ -458,6 +467,14 @@ fn settle<'task, T: ScopedTask<'task>>(
       .and_then(|v| unsafe { ToNapiValue::to_napi_value(env, v) })
     {
       Ok(v) => Ok(Settlement::Fulfill(v)),
+      // A task that stopped because its signal aborted (`AbortToken::check`) rejects like one
+      // cancelled before it ran.
+      Err(e)
+        if e.status == Status::Cancelled
+          && work.abort_signal.as_ref().is_some_and(AbortSignal::aborted) =>
+      {
+        abort_rejection(env, work.abort_signal.as_ref()).map(Settlement::Reject)
+      }
       // `ToNapiValue for Error` hands the retained value back verbatim —
       // the completion callback runs on the owning env/thread, exactly
       // where the retained reference is restorable — and synthesizes a

@@ -2,7 +2,13 @@ import * as events from 'node:events'
 
 import test from 'ava'
 
-import { spawnAsyncTask, withAbortController } from '../index.cjs'
+import {
+  abortSignalAborted,
+  pollAbortToken,
+  pollAbortTokenIsExecuting,
+  spawnAsyncTask,
+  withAbortController,
+} from '../index.cjs'
 
 import { LOAD_IN_WORKER, runInWorker } from './multi-env-helpers.js'
 
@@ -317,3 +323,68 @@ test.serial('the listener ignores its receiver', async (t) => {
   await withAbortController(1, 2, signal)
   t.notThrows(() => (added[0] as () => void).call({}))
 })
+
+test.skipIf(!hasAbortController)('aborted() follows the signal', (t) => {
+  const controller = new AbortController()
+  t.false(abortSignalAborted(controller.signal))
+  controller.abort()
+  t.true(abortSignalAborted(controller.signal))
+})
+
+test('aborted() reads a duck-typed signal', (t) => {
+  t.false(abortSignalAborted(fakeSignal().signal))
+  const aborted = Object.assign(fakeSignal().signal, { aborted: true })
+  t.true(abortSignalAborted(aborted))
+})
+
+/**
+ * Starts `pollAbortToken` and waits until its `compute` is running, so it can't be cancelled. The
+ * promise is wrapped, as returning it from an `async` function would wait for it to settle.
+ */
+async function startPolling(signal: AbortSignal) {
+  const promise = pollAbortToken(signal, false)
+  const deadline = Date.now() + 5000
+  while (!pollAbortTokenIsExecuting()) {
+    if (Date.now() > deadline) throw new Error('compute never started')
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  return { promise }
+}
+
+signalTest(
+  'a running task that stops through its token rejects with the reason',
+  async (t) => {
+    const controller = new AbortController()
+    const { promise } = await startPolling(controller.signal)
+    const reason = new Error('stop')
+    controller.abort(reason)
+    await t.throwsAsync(settledWithin(promise), { is: reason })
+  },
+)
+
+test.serial(
+  'a task stopped through its token without a reason rejects with an AbortError',
+  async (t) => {
+    const { signal, added } = fakeSignal()
+    const { promise } = await startPolling(signal)
+    ;(added[0] as () => void).call(signal)
+    await t.throwsAsync(settledWithin(promise), {
+      name: 'AbortError',
+      message: 'AbortError',
+    })
+  },
+)
+
+signalTest(
+  'Status::Cancelled without an abort rejects with the task error',
+  async (t) => {
+    const controller = new AbortController()
+    await t.throwsAsync(
+      settledWithin(pollAbortToken(controller.signal, true)),
+      {
+        message: 'cancelled without an abort',
+        code: 'Cancelled',
+      },
+    )
+  },
+)

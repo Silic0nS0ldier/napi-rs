@@ -722,6 +722,9 @@ export interface A {
   foo: number
 }
 
+/** `AbortSignal::aborted` for `signal`. */
+export declare function abortSignalAborted(signal: AbortSignal): boolean
+
 export declare function acceptArraybuffer(fixture: ArrayBuffer): bigint
 
 export declare function acceptPromiseExternal(p: Promise<ExternalObject<number>>): Promise<number>
@@ -1998,6 +2001,16 @@ export interface PluginLoadResult {
 }
 
 export declare function plusOne(this: Width): number
+
+/**
+ * Runs a task whose `compute` polls `signal`'s token until it aborts, then fails with
+ * `Status::Cancelled`. With `cancel_immediately`, `compute` fails with `Status::Cancelled` straight
+ * away instead.
+ */
+export declare function pollAbortToken(signal: AbortSignal, cancelImmediately: boolean): Promise<number>
+
+/** Whether the most recent [`poll_abort_token`] task's `compute` has started. */
+export declare function pollAbortTokenIsExecuting(): boolean
 
 export declare function promiseInEither(input: number | Promise<number>): Promise<boolean>
 
