@@ -206,7 +206,7 @@ test.serial.skipIf(Boolean(process.env.WASI_TEST))(
       finallyCalls: 1,
       cancelRefused: true,
       cancelValue: 200,
-      accepted: 'AbortError: AbortError',
+      accepted: 'AbortError: This operation was aborted',
       blockers: Number(process.env.UV_THREADPOOL_SIZE) || 4,
       againValues: 10,
       wrappersCompiled: 1,

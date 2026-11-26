@@ -50,10 +50,13 @@ function saturatePool() {
 }
 
 /** Runs `withAbortController` behind a saturated pool, aborting before it can start. */
-async function abortQueued(signal: AbortSignal, abort: () => void) {
+async function abortQueued(
+  signal: AbortSignal,
+  abort: () => void | Promise<void>,
+) {
   const pool = saturatePool()
   const promise = withAbortController(1, 2, signal)
-  abort()
+  await abort()
   await pool.release()
   return settledWithin(promise).then(
     (value) => ({ value }),
@@ -61,11 +64,40 @@ async function abortQueued(signal: AbortSignal, abort: () => void) {
   )
 }
 
-queuedTest('aborting cancels a queued task', async (t) => {
+queuedTest(
+  'aborting a queued task rejects with the default reason',
+  async (t) => {
+    const controller = new AbortController()
+    const result = await abortQueued(controller.signal, () =>
+      controller.abort(),
+    )
+    t.deepEqual(result, { error: controller.signal.reason })
+    t.like(result.error, { name: 'AbortError' })
+  },
+)
+
+queuedTest('aborting a queued task rejects with a custom reason', async (t) => {
   const controller = new AbortController()
-  const result = await abortQueued(controller.signal, () => controller.abort())
-  t.like(result, { error: { name: 'AbortError' } })
+  const reason = { custom: true }
+  const result = await abortQueued(controller.signal, () =>
+    controller.abort(reason),
+  )
+  t.is((result as { error: unknown }).error, reason)
 })
+
+// `AbortSignal.timeout` is in Node.js from v17.3.
+queuedTest.skipIf(typeof AbortSignal?.timeout !== 'function')(
+  'a timed out signal rejects a queued task with a TimeoutError',
+  async (t) => {
+    const signal = AbortSignal.timeout(1)
+    const result = await abortQueued(signal, async () => {
+      while (!signal.aborted) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+    })
+    t.like(result, { error: { name: 'TimeoutError' } })
+  },
+)
 
 // Every task on a signal is kept in one list, and the abort handler stopped at the first
 // completed one, skipping the tasks after it.
@@ -77,7 +109,53 @@ queuedTest(
     const result = await abortQueued(controller.signal, () =>
       controller.abort(),
     )
-    t.like(result, { error: { name: 'AbortError' } })
+    t.deepEqual(result, { error: controller.signal.reason })
+  },
+)
+
+/**
+ * Calls `withAbortController` with an already-aborted signal while every pool thread is busy, and
+ * waits for it to settle before freeing them. A task that was queued couldn't settle in time.
+ */
+async function callAborted(signal: AbortSignal) {
+  const pool = saturatePool()
+  try {
+    return await settledWithin(withAbortController(1, 2, signal), 1000).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+  } finally {
+    await pool.release()
+  }
+}
+
+queuedTest(
+  'an already-aborted signal rejects with its reason without queuing the task',
+  async (t) => {
+    const controller = new AbortController()
+    const reason = new Error('already aborted')
+    controller.abort(reason)
+    t.deepEqual(await callAborted(controller.signal), { error: reason })
+  },
+)
+
+test.serial.skipIf(Boolean(process.env.WASI_TEST))(
+  'an already-aborted duck-typed signal rejects with its reason',
+  async (t) => {
+    const reason = new Error('already aborted')
+    const signal = Object.assign(fakeSignal().signal, { aborted: true, reason })
+    t.deepEqual(await callAborted(signal), { error: reason })
+  },
+)
+
+// Node.js before v17.2 and some polyfills have no `reason`.
+test.serial.skipIf(Boolean(process.env.WASI_TEST))(
+  'an already-aborted signal without a reason rejects with an AbortError',
+  async (t) => {
+    const signal = Object.assign(fakeSignal().signal, { aborted: true })
+    t.like(await callAborted(signal), {
+      error: { name: 'AbortError', message: 'AbortError' },
+    })
   },
 )
 
@@ -145,7 +223,8 @@ test.serial.skipIf(Boolean(process.env.WASI_TEST))(
     const result = await abortQueued(signal, () =>
       (added[0] as () => void).call(signal),
     )
-    t.like(result, { error: { name: 'AbortError' } })
+    // The fake has no `reason`, so this is the fallback.
+    t.like(result, { error: { name: 'AbortError', message: 'AbortError' } })
   },
 )
 
